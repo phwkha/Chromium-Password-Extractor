@@ -1,9 +1,9 @@
-﻿
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.14.36908.2 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ANM", "ANM\ANM.vcxproj", "{31FB3C2B-02AA-454C-8C42-B0030ECDF152}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ChromiumPassExtractor", "ChromiumPassExtractor\ChromiumPassExtractor.vcxproj", "{31FB3C2B-02AA-454C-8C42-B0030ECDF152}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
